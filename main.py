@@ -59,6 +59,9 @@ class MediaStreamHandler:
         deepgram_connection = None
         call_session_id_ref = [None]  # Mutable reference, initialized early
 
+        # Get the current event loop for scheduling async tasks from sync callbacks
+        event_loop = asyncio.get_event_loop()
+
         try:
             # Log the full path including query parameters
             # The path variable should include query string: /stream?callSessionId=123&twilioCallSid=CAxxx
@@ -183,9 +186,15 @@ class MediaStreamHandler:
                 logger.info(f"Transcript handler called! args count: {len(args)}, kwargs: {list(kwargs.keys())}")
                 current_id = call_session_id_ref[0]
                 if current_id:
-                    logger.info(f"Creating async task for transcript processing, call_session_id: {current_id}")
-                    # Create a task to run the async function
-                    asyncio.create_task(self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs))
+                    logger.info(f"Scheduling async task for transcript processing, call_session_id: {current_id}")
+                    # Deepgram SDK calls handlers from its own thread, so we need to use run_coroutine_threadsafe
+                    # to schedule the async function on the event loop from a different thread
+                    coro = self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs)
+                    try:
+                        # Schedule the coroutine on the event loop from this thread
+                        asyncio.run_coroutine_threadsafe(coro, event_loop)
+                    except Exception as e:
+                        logger.error(f"Error scheduling transcript task: {e}", exc_info=True)
                 else:
                     logger.warning("Received transcript but no call_session_id yet")
 
