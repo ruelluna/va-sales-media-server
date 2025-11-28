@@ -60,12 +60,22 @@ class MediaStreamHandler:
         deepgram_connection = None
 
         try:
-            logger.info(f"New WebSocket connection from {websocket.remote_address}, path: {path}")
+            # Log the full path including query parameters
+            # The path variable should include query string: /stream?callSessionId=123&twilioCallSid=CAxxx
+            logger.info(f"New WebSocket connection from {websocket.remote_address}")
+            logger.info(f"Full path received: {path}")
 
             # Parse query parameters from the WebSocket URL path
-            # Twilio sends parameters as query string: /stream?callSessionId=123&twilioCallSid=CAxxx
-            parsed_path = urlparse(f"http://dummy{path}")
+            # Twilio sends parameters as query string in the path
+            # Handle both cases: path with or without query string
+            if '?' in path:
+                parsed_path = urlparse(f"http://dummy{path}")
+            else:
+                # If no query string in path, try to get from request headers
+                parsed_path = urlparse(f"http://dummy{path}")
+
             query_params = parse_qs(parsed_path.query)
+            logger.info(f"Query parameters extracted: {query_params}")
 
             # Extract parameters (parse_qs returns lists, so get first element)
             call_session_id = query_params.get('callSessionId', [None])[0]
@@ -326,11 +336,17 @@ async def main():
     logger.info(f"Laravel API URL: {LARAVEL_API_URL}")
     logger.info(f"Deepgram API configured: {'Yes' if DEEPGRAM_API_KEY else 'No'}")
 
-    # Create WebSocket server
+    # Create WebSocket server with process_request to access full request path
+    async def process_request(path, request_headers):
+        """Process WebSocket request to extract full path with query parameters"""
+        # The path already includes query parameters in websockets library
+        return None  # Return None to accept the connection
+
     handler.server = await websockets.serve(
         handler.handle_twilio_stream,
         "0.0.0.0",
         MEDIA_STREAM_PORT,
+        process_request=process_request,
         ping_interval=20,
         ping_timeout=10,
         close_timeout=10
