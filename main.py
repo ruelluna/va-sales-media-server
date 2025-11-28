@@ -89,8 +89,8 @@ class MediaStreamHandler:
 
             logger.info(f"Parsed parameters from URL - Call session ID: {call_session_id}, Twilio SID: {twilio_call_sid}")
 
-            # Twilio sends a 'connected' event message first, wait for it
-            # The parameters should be in the URL, but we'll also check the connected event
+            # Twilio sends a 'connected' event message first with Parameter values
+            # The <Parameter> elements from TwiML are sent in the 'connected' event payload
             try:
                 initial_message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
                 if isinstance(initial_message, str):
@@ -98,15 +98,34 @@ class MediaStreamHandler:
                         params = json.loads(initial_message)
                         event_type = params.get('event')
                         logger.info(f"Received initial message from Twilio: event={event_type}")
+                        logger.info(f"Full message payload: {json.dumps(params, indent=2)}")
 
                         # Twilio sends 'connected' event first
                         if event_type == 'connected':
-                            # Parameters should already be in URL, but log for debugging
                             logger.info("Twilio Media Stream connected")
-                        # If parameters weren't in URL, try to get from message (fallback)
-                        if not call_session_id:
-                            call_session_id = params.get('callSessionId') or params.get('callSession')
-                            twilio_call_sid = params.get('twilioCallSid') or params.get('callSid')
+                            # Extract parameters from the 'connected' event payload
+                            # Twilio sends Parameter values in the 'protocol' or 'streamSid' fields
+                            # But actually, they're in a 'params' object or directly in the payload
+
+                            # Check for parameters in various possible locations
+                            if 'params' in params:
+                                call_session_id = call_session_id or params['params'].get('callSessionId')
+                                twilio_call_sid = twilio_call_sid or params['params'].get('twilioCallSid')
+
+                            # Also check direct fields (Twilio might send them directly)
+                            call_session_id = call_session_id or params.get('callSessionId') or params.get('callSession')
+                            twilio_call_sid = twilio_call_sid or params.get('twilioCallSid') or params.get('callSid')
+
+                            # Check in protocol object if it exists
+                            if 'protocol' in params and isinstance(params['protocol'], dict):
+                                call_session_id = call_session_id or params['protocol'].get('callSessionId')
+                                twilio_call_sid = twilio_call_sid or params['protocol'].get('twilioCallSid')
+
+                            logger.info(f"After parsing connected event - Call session ID: {call_session_id}, Twilio SID: {twilio_call_sid}")
+                        else:
+                            # If it's not a connected event, try to extract parameters anyway
+                            call_session_id = call_session_id or params.get('callSessionId') or params.get('callSession')
+                            twilio_call_sid = twilio_call_sid or params.get('twilioCallSid') or params.get('callSid')
                     except json.JSONDecodeError as e:
                         logger.warning(f"Initial message is not JSON: {initial_message[:100]}, error: {e}")
             except asyncio.TimeoutError:
@@ -159,6 +178,7 @@ class MediaStreamHandler:
             }
 
             # Forward audio from Twilio to Deepgram
+            # Also watch for 'start' event which may contain parameters
             async for message in websocket:
                 if isinstance(message, str):
                     try:
