@@ -14,6 +14,7 @@ import base64
 import signal
 import sys
 import logging
+from urllib.parse import urlparse, parse_qs
 import websockets
 import aiohttp
 from deepgram import DeepgramClient, PrerecordedOptions, LiveOptions, LiveTranscriptionEvents
@@ -54,40 +55,60 @@ class MediaStreamHandler:
 
     async def handle_twilio_stream(self, websocket, path):
         """Handle incoming Twilio Media Stream WebSocket connection"""
-        # Only accept connections on /stream path
-        if path != '/stream':
-            logger.warning(f"Rejected connection to invalid path: {path}")
-            await websocket.close(code=4004, reason="Invalid path")
-            return
-
         call_session_id = None
         twilio_call_sid = None
         deepgram_connection = None
 
         try:
-            logger.info(f"New WebSocket connection from {websocket.remote_address}")
+            logger.info(f"New WebSocket connection from {websocket.remote_address}, path: {path}")
 
-            # Receive initial connection parameters from Twilio
+            # Parse query parameters from the WebSocket URL path
+            # Twilio sends parameters as query string: /stream?callSessionId=123&twilioCallSid=CAxxx
+            parsed_path = urlparse(f"http://dummy{path}")
+            query_params = parse_qs(parsed_path.query)
+
+            # Extract parameters (parse_qs returns lists, so get first element)
+            call_session_id = query_params.get('callSessionId', [None])[0]
+            twilio_call_sid = query_params.get('twilioCallSid', [None])[0]
+
+            # Also check for alternative parameter names
+            if not call_session_id:
+                call_session_id = query_params.get('callSession', [None])[0]
+            if not twilio_call_sid:
+                twilio_call_sid = query_params.get('callSid', [None])[0]
+
+            logger.info(f"Parsed parameters from URL - Call session ID: {call_session_id}, Twilio SID: {twilio_call_sid}")
+
+            # Twilio sends a 'connected' event message first, wait for it
+            # The parameters should be in the URL, but we'll also check the connected event
             try:
-                initial_message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+                initial_message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
                 if isinstance(initial_message, str):
-                    params = json.loads(initial_message)
-                    call_session_id = params.get('callSessionId')
-                    twilio_call_sid = params.get('twilioCallSid')
-                    logger.info(f"Call session initialized: {call_session_id}, Twilio SID: {twilio_call_sid}")
+                    try:
+                        params = json.loads(initial_message)
+                        event_type = params.get('event')
+                        logger.info(f"Received initial message from Twilio: event={event_type}")
+
+                        # Twilio sends 'connected' event first
+                        if event_type == 'connected':
+                            # Parameters should already be in URL, but log for debugging
+                            logger.info("Twilio Media Stream connected")
+                        # If parameters weren't in URL, try to get from message (fallback)
+                        if not call_session_id:
+                            call_session_id = params.get('callSessionId') or params.get('callSession')
+                            twilio_call_sid = params.get('twilioCallSid') or params.get('callSid')
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Initial message is not JSON: {initial_message[:100]}, error: {e}")
             except asyncio.TimeoutError:
-                logger.error("Timeout waiting for initial message from Twilio")
-                await websocket.close(code=4008, reason="Timeout waiting for initial message")
-                return
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in initial message: {e}")
-                await websocket.close(code=4007, reason="Invalid message format")
-                return
+                logger.warning("Timeout waiting for initial 'connected' message from Twilio")
 
             if not call_session_id:
-                logger.warning("No call_session_id provided in initial message")
-                await websocket.close(code=4003, reason="Missing call_session_id")
+                logger.error("No call_session_id found in URL parameters or initial message")
+                logger.error(f"Path was: {path}, Query params: {query_params}")
+                await websocket.close(code=4003, reason="Missing call_session_id parameter")
                 return
+
+            logger.info(f"Processing stream for call session: {call_session_id}")
 
             # Create Deepgram live connection
             try:
