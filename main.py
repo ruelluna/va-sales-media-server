@@ -169,45 +169,73 @@ class MediaStreamHandler:
                     logger.info("Successfully created Deepgram connection using 'live' API")
                 except Exception as e2:
                     logger.error(f"Failed to create Deepgram connection: {e2}")
-                    await websocket.close(code=5001, reason="Failed to initialize transcription")
+                    await websocket.close(code=1011, reason="Failed to initialize transcription")
                     return
             except Exception as e:
                 logger.error(f"Failed to create Deepgram connection: {e}")
-                await websocket.close(code=5001, reason="Failed to initialize transcription")
+                await websocket.close(code=1011, reason="Failed to initialize transcription")
                 return
 
             # Set up Deepgram event handlers
             # call_session_id_ref is already initialized as a mutable reference
 
             def transcript_handler(*args, **kwargs):
+                logger.info(f"Transcript handler called! args count: {len(args)}, kwargs: {list(kwargs.keys())}")
                 current_id = call_session_id_ref[0]
                 if current_id:
+                    logger.info(f"Creating async task for transcript processing, call_session_id: {current_id}")
                     # Create a task to run the async function
                     asyncio.create_task(self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs))
                 else:
                     logger.warning("Received transcript but no call_session_id yet")
 
+            # Register event handlers
             deepgram_connection.on(LiveTranscriptionEvents.Open, self.on_deepgram_open)
             deepgram_connection.on(LiveTranscriptionEvents.Transcript, transcript_handler)
             deepgram_connection.on(LiveTranscriptionEvents.Error, self.on_deepgram_error)
             deepgram_connection.on(LiveTranscriptionEvents.Close, self.on_deepgram_close)
 
+            # Log that handlers are registered
+            logger.info("Deepgram event handlers registered: Open, Transcript, Error, Close")
+
             # Start Deepgram connection
+            # Twilio sends mu-law audio at 8000 Hz, converted to PCM16
+            # Deepgram should auto-detect the format, but we'll try specifying it
             try:
-                if not deepgram_connection.start(LiveOptions(
-                    model="nova-2",
-                    language="en-US",
-                    smart_format=True,
-                    interim_results=True,
-                    utterance_end_ms=1000,
-                    vad_events=True,
-                )):
+                # Try with sample_rate and encoding first
+                try:
+                    options = LiveOptions(
+                        model="nova-2",
+                        language="en-US",
+                        smart_format=True,
+                        interim_results=True,
+                        utterance_end_ms=1000,
+                        vad_events=True,
+                        sample_rate=8000,
+                        encoding="linear16",
+                    )
+                    logger.info("Created LiveOptions with sample_rate=8000, encoding=linear16")
+                except TypeError:
+                    # If those parameters aren't supported, use basic options
+                    logger.warning("sample_rate/encoding not supported in LiveOptions, using basic options")
+                    options = LiveOptions(
+                        model="nova-2",
+                        language="en-US",
+                        smart_format=True,
+                        interim_results=True,
+                        utterance_end_ms=1000,
+                        vad_events=True,
+                    )
+                    logger.info("Created LiveOptions with basic options (auto-detect format)")
+
+                if not deepgram_connection.start(options):
                     logger.error("Failed to start Deepgram connection")
-                    await websocket.close(code=5002, reason="Failed to start transcription")
+                    await websocket.close(code=1011, reason="Failed to start transcription")
                     return
+                logger.info("Deepgram connection started successfully")
             except Exception as e:
-                logger.error(f"Error starting Deepgram: {e}")
-                await websocket.close(code=5002, reason="Failed to start transcription")
+                logger.error(f"Error starting Deepgram: {e}", exc_info=True)
+                await websocket.close(code=1011, reason="Failed to start transcription")
                 return
 
             # Store connection info
@@ -299,8 +327,10 @@ class MediaStreamHandler:
                         logger.error(f"Error processing message: {e}")
                         continue
 
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Twilio connection closed for call {call_session_id_ref[0]}")
+        except websockets.exceptions.ConnectionClosedOK:
+            logger.info(f"Twilio connection closed gracefully for call {call_session_id_ref[0]}")
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"Twilio connection closed unexpectedly for call {call_session_id_ref[0]}: {e.code} - {e.reason}")
         except Exception as e:
             logger.error(f"Error handling stream for call {call_session_id_ref[0]}: {e}", exc_info=True)
         finally:
@@ -365,7 +395,7 @@ class MediaStreamHandler:
 
     def on_deepgram_open(self, *args, **kwargs):
         """Handle Deepgram connection open"""
-        logger.info("Deepgram connection opened")
+        logger.info(f"Deepgram connection opened - args: {args}, kwargs: {kwargs}")
 
     async def on_deepgram_transcript(self, *args, call_session_id=None, **kwargs):
         """Handle Deepgram transcript events"""
@@ -452,12 +482,16 @@ class MediaStreamHandler:
 
     def on_deepgram_error(self, *args, **kwargs):
         """Handle Deepgram errors"""
+        logger.error(f"Deepgram error event received: args={args}, kwargs={kwargs}")
         if args:
-            logger.error(f"Deepgram error: {args[0]}")
+            logger.error(f"Deepgram error details: {args[0]}")
+        # Log all arguments for debugging
+        for i, arg in enumerate(args):
+            logger.error(f"Deepgram error arg[{i}]: {arg} (type: {type(arg)})")
 
     def on_deepgram_close(self, *args, **kwargs):
         """Handle Deepgram connection close"""
-        logger.info("Deepgram connection closed")
+        logger.info(f"Deepgram connection closed - args: {args}, kwargs: {kwargs}")
 
 
 async def main():
