@@ -17,8 +17,7 @@ import logging
 from urllib.parse import urlparse, parse_qs
 import websockets
 import aiohttp
-from deepgram import DeepgramClient, PrerecordedOptions, LiveOptions, LiveTranscriptionEvents
-from deepgram.clients.live import LiveClient
+from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from dotenv import load_dotenv
 
 # Configure logging
@@ -154,8 +153,23 @@ class MediaStreamHandler:
                 logger.info(f"Processing stream for call session: {call_session_id}")
 
             # Create Deepgram live connection
+            # For Deepgram SDK 3.2.7, the API is: deepgram.listen.websocket.v("1")
             try:
+                # Check what methods are available on listen object
+                logger.debug(f"Available methods on listen: {dir(self.deepgram.listen)}")
                 deepgram_connection = self.deepgram.listen.websocket.v("1")
+            except AttributeError as e:
+                logger.error(f"Deepgram API error - 'websocket' not found: {e}")
+                logger.error(f"Available attributes on listen object: {[attr for attr in dir(self.deepgram.listen) if not attr.startswith('_')]}")
+                # Try alternative API
+                try:
+                    # Maybe it's 'live' instead of 'websocket'
+                    deepgram_connection = self.deepgram.listen.live.v("1")
+                    logger.info("Successfully created Deepgram connection using 'live' API")
+                except Exception as e2:
+                    logger.error(f"Failed to create Deepgram connection: {e2}")
+                    await websocket.close(code=5001, reason="Failed to initialize transcription")
+                    return
             except Exception as e:
                 logger.error(f"Failed to create Deepgram connection: {e}")
                 await websocket.close(code=5001, reason="Failed to initialize transcription")
