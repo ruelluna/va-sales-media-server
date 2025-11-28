@@ -57,6 +57,7 @@ class MediaStreamHandler:
         call_session_id = None
         twilio_call_sid = None
         deepgram_connection = None
+        call_session_id_ref = [None]  # Mutable reference, initialized early
 
         try:
             # Log the full path including query parameters
@@ -77,16 +78,16 @@ class MediaStreamHandler:
             logger.info(f"Query parameters extracted: {query_params}")
 
             # Extract parameters (parse_qs returns lists, so get first element)
-            call_session_id = query_params.get('callSessionId', [None])[0]
+            call_session_id_ref[0] = query_params.get('callSessionId', [None])[0]
             twilio_call_sid = query_params.get('twilioCallSid', [None])[0]
 
             # Also check for alternative parameter names
-            if not call_session_id:
-                call_session_id = query_params.get('callSession', [None])[0]
+            if not call_session_id_ref[0]:
+                call_session_id_ref[0] = query_params.get('callSession', [None])[0]
             if not twilio_call_sid:
                 twilio_call_sid = query_params.get('callSid', [None])[0]
 
-            logger.info(f"Parsed parameters from URL - Call session ID: {call_session_id}, Twilio SID: {twilio_call_sid}")
+            logger.info(f"Parsed parameters from URL - Call session ID: {call_session_id_ref[0]}, Twilio SID: {twilio_call_sid}")
 
             # Twilio sends a 'connected' event message first with Parameter values
             # The <Parameter> elements from TwiML are sent in the 'connected' event payload
@@ -113,30 +114,30 @@ class MediaStreamHandler:
 
                             # Check for parameters in various possible locations
                             if 'params' in params:
-                                call_session_id = call_session_id or params['params'].get('callSessionId')
+                                call_session_id_ref[0] = call_session_id_ref[0] or params['params'].get('callSessionId')
                                 twilio_call_sid = twilio_call_sid or params['params'].get('twilioCallSid')
 
                             # Check direct fields
-                            call_session_id = call_session_id or params.get('callSessionId') or params.get('callSession')
+                            call_session_id_ref[0] = call_session_id_ref[0] or params.get('callSessionId') or params.get('callSession')
                             twilio_call_sid = twilio_call_sid or params.get('twilioCallSid') or params.get('callSid')
 
                             # Check in protocol object if it exists
                             if 'protocol' in params and isinstance(params['protocol'], dict):
-                                call_session_id = call_session_id or params['protocol'].get('callSessionId')
+                                call_session_id_ref[0] = call_session_id_ref[0] or params['protocol'].get('callSessionId')
                                 twilio_call_sid = twilio_call_sid or params['protocol'].get('twilioCallSid')
 
                             # Check in streamSid or other fields
                             if 'streamSid' in params:
                                 logger.info(f"Stream SID: {params.get('streamSid')}")
 
-                            logger.info(f"After parsing connected event - Call session ID: {call_session_id}, Twilio SID: {twilio_call_sid}")
+                            logger.info(f"After parsing connected event - Call session ID: {call_session_id_ref[0]}, Twilio SID: {twilio_call_sid}")
 
                             # If still no call_session_id, don't close yet - wait for 'start' event
-                            if not call_session_id:
+                            if not call_session_id_ref[0]:
                                 logger.warning("No call_session_id in connected event, will check 'start' event")
                         else:
                             # If it's not a connected event, try to extract parameters anyway
-                            call_session_id = call_session_id or params.get('callSessionId') or params.get('callSession')
+                            call_session_id_ref[0] = call_session_id_ref[0] or params.get('callSessionId') or params.get('callSession')
                             twilio_call_sid = twilio_call_sid or params.get('twilioCallSid') or params.get('callSid')
                     except json.JSONDecodeError as e:
                         logger.warning(f"Initial message is not JSON: {initial_message[:100]}, error: {e}")
@@ -145,12 +146,12 @@ class MediaStreamHandler:
 
             # Don't close connection if we don't have call_session_id yet
             # Continue processing messages - parameters might come in 'start' event
-            if not call_session_id:
+            if not call_session_id_ref[0]:
                 logger.warning("No call_session_id found yet, continuing to process messages")
                 logger.warning(f"Path was: {path}, Query params: {query_params}")
                 # Continue - we'll check for call_session_id in subsequent messages
             else:
-                logger.info(f"Processing stream for call session: {call_session_id}")
+                logger.info(f"Processing stream for call session: {call_session_id_ref[0]}")
 
             # Create Deepgram live connection
             # For Deepgram SDK 3.2.7, the API is: deepgram.listen.websocket.v("1")
@@ -176,8 +177,7 @@ class MediaStreamHandler:
                 return
 
             # Set up Deepgram event handlers
-            # Use a mutable reference for call_session_id since it might be set later
-            call_session_id_ref = [call_session_id]  # Use list for mutability
+            # call_session_id_ref is already initialized as a mutable reference
 
             def transcript_handler(*args, **kwargs):
                 current_id = call_session_id_ref[0]
@@ -217,8 +217,8 @@ class MediaStreamHandler:
                 'call_session_id_ref': call_session_id_ref
             }
 
-            if call_session_id:
-                self.active_streams[call_session_id] = connection_info
+            if call_session_id_ref[0]:
+                self.active_streams[call_session_id_ref[0]] = connection_info
 
             # Forward audio from Twilio to Deepgram
             # Also watch for 'start' event which may contain parameters
@@ -235,17 +235,37 @@ class MediaStreamHandler:
                             if not call_session_id_ref[0]:
                                 # Try to extract from start event
                                 start_data = data.get('start', {})
-                                call_session_id_ref[0] = start_data.get('callSessionId') or start_data.get('callSession') or data.get('callSessionId') or data.get('callSession')
-                                twilio_call_sid = twilio_call_sid or start_data.get('twilioCallSid') or start_data.get('callSid') or data.get('twilioCallSid') or data.get('callSid')
+
+                                # Check customParameters first (where Twilio sends <Parameter> values)
+                                custom_params = start_data.get('customParameters', {})
+                                call_session_id_ref[0] = (
+                                    custom_params.get('callSessionId') or
+                                    custom_params.get('callSession') or
+                                    start_data.get('callSessionId') or
+                                    start_data.get('callSession') or
+                                    data.get('callSessionId') or
+                                    data.get('callSession')
+                                )
+
+                                # Extract Twilio call SID from start event
+                                twilio_call_sid = (
+                                    twilio_call_sid or
+                                    start_data.get('callSid') or
+                                    data.get('callSid') or
+                                    data.get('twilioCallSid')
+                                )
 
                                 if call_session_id_ref[0]:
                                     logger.info(f"Found call_session_id in 'start' event: {call_session_id_ref[0]}")
+                                    logger.info(f"Twilio Call SID: {twilio_call_sid}")
                                     # Update connection info
                                     connection_info['twilio_call_sid'] = twilio_call_sid
                                     self.active_streams[call_session_id_ref[0]] = connection_info
                                     logger.info(f"Processing stream for call session: {call_session_id_ref[0]}")
                                 else:
                                     logger.warning("Still no call_session_id found in 'start' event")
+                                    logger.warning(f"Checked customParameters: {custom_params}")
+                                    logger.warning(f"Checked start_data keys: {list(start_data.keys())}")
 
                         if event == 'media':
                             # Decode mu-law audio from Twilio
@@ -270,18 +290,22 @@ class MediaStreamHandler:
                         continue
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Twilio connection closed for call {call_session_id}")
+            logger.info(f"Twilio connection closed for call {call_session_id_ref[0]}")
         except Exception as e:
-            logger.error(f"Error handling stream: {e}", exc_info=True)
+            logger.error(f"Error handling stream for call {call_session_id_ref[0]}: {e}", exc_info=True)
         finally:
+            final_call_session_id = call_session_id_ref[0]
+
             if deepgram_connection:
                 try:
                     deepgram_connection.finish()
+                    logger.info(f"Deepgram connection finished for call {final_call_session_id}")
                 except Exception as e:
-                    logger.error(f"Error closing Deepgram connection: {e}")
-            if call_session_id and call_session_id in self.active_streams:
-                self.active_streams.pop(call_session_id, None)
-                logger.info(f"Cleaned up stream for call session {call_session_id}")
+                    logger.error(f"Error closing Deepgram connection for call {final_call_session_id}: {e}")
+
+            if final_call_session_id and final_call_session_id in self.active_streams:
+                self.active_streams.pop(final_call_session_id, None)
+                logger.info(f"Cleaned up stream for call session {final_call_session_id}")
 
     def mulaw_to_pcm(self, mulaw_data):
         """Convert mu-law audio to PCM16"""
