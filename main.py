@@ -98,21 +98,26 @@ class MediaStreamHandler:
                         params = json.loads(initial_message)
                         event_type = params.get('event')
                         logger.info(f"Received initial message from Twilio: event={event_type}")
-                        logger.info(f"Full message payload: {json.dumps(params, indent=2)}")
+                        # Log the full payload to see what Twilio actually sends
+                        try:
+                            logger.info(f"Full message payload: {json.dumps(params, indent=2)}")
+                        except Exception as e:
+                            logger.warning(f"Could not serialize payload: {e}")
+                            logger.info(f"Payload keys: {list(params.keys()) if isinstance(params, dict) else 'Not a dict'}")
 
                         # Twilio sends 'connected' event first
                         if event_type == 'connected':
                             logger.info("Twilio Media Stream connected")
-                            # Extract parameters from the 'connected' event payload
-                            # Twilio sends Parameter values in the 'protocol' or 'streamSid' fields
-                            # But actually, they're in a 'params' object or directly in the payload
+                            # According to Twilio docs, <Parameter> elements are sent as query params in URL
+                            # But if not in URL, they might be in the message payload
+                            # Check all possible locations in the payload
 
                             # Check for parameters in various possible locations
                             if 'params' in params:
                                 call_session_id = call_session_id or params['params'].get('callSessionId')
                                 twilio_call_sid = twilio_call_sid or params['params'].get('twilioCallSid')
 
-                            # Also check direct fields (Twilio might send them directly)
+                            # Check direct fields
                             call_session_id = call_session_id or params.get('callSessionId') or params.get('callSession')
                             twilio_call_sid = twilio_call_sid or params.get('twilioCallSid') or params.get('callSid')
 
@@ -121,7 +126,15 @@ class MediaStreamHandler:
                                 call_session_id = call_session_id or params['protocol'].get('callSessionId')
                                 twilio_call_sid = twilio_call_sid or params['protocol'].get('twilioCallSid')
 
+                            # Check in streamSid or other fields
+                            if 'streamSid' in params:
+                                logger.info(f"Stream SID: {params.get('streamSid')}")
+
                             logger.info(f"After parsing connected event - Call session ID: {call_session_id}, Twilio SID: {twilio_call_sid}")
+
+                            # If still no call_session_id, don't close yet - wait for 'start' event
+                            if not call_session_id:
+                                logger.warning("No call_session_id in connected event, will check 'start' event")
                         else:
                             # If it's not a connected event, try to extract parameters anyway
                             call_session_id = call_session_id or params.get('callSessionId') or params.get('callSession')
@@ -131,13 +144,14 @@ class MediaStreamHandler:
             except asyncio.TimeoutError:
                 logger.warning("Timeout waiting for initial 'connected' message from Twilio")
 
+            # Don't close connection if we don't have call_session_id yet
+            # Continue processing messages - parameters might come in 'start' event
             if not call_session_id:
-                logger.error("No call_session_id found in URL parameters or initial message")
-                logger.error(f"Path was: {path}, Query params: {query_params}")
-                await websocket.close(code=4003, reason="Missing call_session_id parameter")
-                return
-
-            logger.info(f"Processing stream for call session: {call_session_id}")
+                logger.warning("No call_session_id found yet, continuing to process messages")
+                logger.warning(f"Path was: {path}, Query params: {query_params}")
+                # Continue - we'll check for call_session_id in subsequent messages
+            else:
+                logger.info(f"Processing stream for call session: {call_session_id}")
 
             # Create Deepgram live connection
             try:
@@ -148,8 +162,18 @@ class MediaStreamHandler:
                 return
 
             # Set up Deepgram event handlers
+            # Use a mutable reference for call_session_id since it might be set later
+            call_session_id_ref = [call_session_id]  # Use list for mutability
+
+            def transcript_handler(*args, **kwargs):
+                current_id = call_session_id_ref[0]
+                if current_id:
+                    self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs)
+                else:
+                    logger.warning("Received transcript but no call_session_id yet")
+
             deepgram_connection.on(LiveTranscriptionEvents.Open, self.on_deepgram_open)
-            deepgram_connection.on(LiveTranscriptionEvents.Transcript, lambda *args: self.on_deepgram_transcript(*args, call_session_id=call_session_id))
+            deepgram_connection.on(LiveTranscriptionEvents.Transcript, transcript_handler)
             deepgram_connection.on(LiveTranscriptionEvents.Error, self.on_deepgram_error)
             deepgram_connection.on(LiveTranscriptionEvents.Close, self.on_deepgram_close)
 
@@ -171,11 +195,16 @@ class MediaStreamHandler:
                 await websocket.close(code=5002, reason="Failed to start transcription")
                 return
 
-            self.active_streams[call_session_id] = {
+            # Store connection info
+            connection_info = {
                 'websocket': websocket,
                 'deepgram': deepgram_connection,
-                'twilio_call_sid': twilio_call_sid
+                'twilio_call_sid': twilio_call_sid,
+                'call_session_id_ref': call_session_id_ref
             }
+
+            if call_session_id:
+                self.active_streams[call_session_id] = connection_info
 
             # Forward audio from Twilio to Deepgram
             # Also watch for 'start' event which may contain parameters
@@ -184,6 +213,25 @@ class MediaStreamHandler:
                     try:
                         data = json.loads(message)
                         event = data.get('event')
+
+                        # Check for 'start' event which contains stream metadata
+                        if event == 'start':
+                            logger.info(f"Received 'start' event: {json.dumps(data, indent=2)}")
+                            # Parameters might be in the 'start' event
+                            if not call_session_id_ref[0]:
+                                # Try to extract from start event
+                                start_data = data.get('start', {})
+                                call_session_id_ref[0] = start_data.get('callSessionId') or start_data.get('callSession') or data.get('callSessionId') or data.get('callSession')
+                                twilio_call_sid = twilio_call_sid or start_data.get('twilioCallSid') or start_data.get('callSid') or data.get('twilioCallSid') or data.get('callSid')
+
+                                if call_session_id_ref[0]:
+                                    logger.info(f"Found call_session_id in 'start' event: {call_session_id_ref[0]}")
+                                    # Update connection info
+                                    connection_info['twilio_call_sid'] = twilio_call_sid
+                                    self.active_streams[call_session_id_ref[0]] = connection_info
+                                    logger.info(f"Processing stream for call session: {call_session_id_ref[0]}")
+                                else:
+                                    logger.warning("Still no call_session_id found in 'start' event")
 
                         if event == 'media':
                             # Decode mu-law audio from Twilio
@@ -356,17 +404,13 @@ async def main():
     logger.info(f"Laravel API URL: {LARAVEL_API_URL}")
     logger.info(f"Deepgram API configured: {'Yes' if DEEPGRAM_API_KEY else 'No'}")
 
-    # Create WebSocket server with process_request to access full request path
-    async def process_request(path, request_headers):
-        """Process WebSocket request to extract full path with query parameters"""
-        # The path already includes query parameters in websockets library
-        return None  # Return None to accept the connection
-
+    # Create WebSocket server
+    # Note: The path parameter in handle_twilio_stream should include query parameters
+    # If not, we'll extract them from the connected event message
     handler.server = await websockets.serve(
         handler.handle_twilio_stream,
         "0.0.0.0",
         MEDIA_STREAM_PORT,
-        process_request=process_request,
         ping_interval=20,
         ping_timeout=10,
         close_timeout=10
