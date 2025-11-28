@@ -182,7 +182,8 @@ class MediaStreamHandler:
             def transcript_handler(*args, **kwargs):
                 current_id = call_session_id_ref[0]
                 if current_id:
-                    self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs)
+                    # Create a task to run the async function
+                    asyncio.create_task(self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs))
                 else:
                     logger.warning("Received transcript but no call_session_id yet")
 
@@ -214,7 +215,8 @@ class MediaStreamHandler:
                 'websocket': websocket,
                 'deepgram': deepgram_connection,
                 'twilio_call_sid': twilio_call_sid,
-                'call_session_id_ref': call_session_id_ref
+                'call_session_id_ref': call_session_id_ref,
+                'media_count': 0  # Track number of media packets received
             }
 
             if call_session_id_ref[0]:
@@ -269,6 +271,7 @@ class MediaStreamHandler:
 
                         if event == 'media':
                             # Decode mu-law audio from Twilio
+                            connection_info['media_count'] = connection_info.get('media_count', 0) + 1
                             payload = data.get('media', {}).get('payload')
                             if payload:
                                 try:
@@ -279,9 +282,16 @@ class MediaStreamHandler:
                                     # Send to Deepgram
                                     if deepgram_connection:
                                         deepgram_connection.send(pcm_audio)
+                                        # Log every 100th packet to avoid spam
+                                        if connection_info['media_count'] % 100 == 0:
+                                            logger.info(f"Sent {connection_info['media_count']} audio packets to Deepgram (latest: {len(pcm_audio)} bytes)")
+                                    else:
+                                        logger.warning("Deepgram connection not available when trying to send audio")
                                 except Exception as e:
-                                    logger.error(f"Error processing audio data: {e}")
+                                    logger.error(f"Error processing audio data: {e}", exc_info=True)
                                     continue
+                            else:
+                                logger.debug("Media event received but no payload")
                     except json.JSONDecodeError as e:
                         logger.warning(f"Invalid JSON received: {e}")
                         continue
@@ -359,16 +369,31 @@ class MediaStreamHandler:
 
     async def on_deepgram_transcript(self, *args, call_session_id=None, **kwargs):
         """Handle Deepgram transcript events"""
+        logger.info(f"Deepgram transcript event received for call_session_id: {call_session_id}")
+
         if not args or len(args) == 0:
+            logger.warning("Deepgram transcript event has no arguments")
             return
 
         result = args[0]
         if not result:
+            logger.warning("Deepgram transcript result is None")
             return
 
         try:
-            sentence = result.channel.alternatives[0].transcript if result.channel.alternatives else None
+            # Log the result structure for debugging
+            logger.debug(f"Deepgram result type: {type(result)}")
+            logger.debug(f"Deepgram result attributes: {dir(result)}")
+
+            # Extract transcript text
+            sentence = None
+            if hasattr(result, 'channel') and hasattr(result.channel, 'alternatives'):
+                if result.channel.alternatives and len(result.channel.alternatives) > 0:
+                    sentence = result.channel.alternatives[0].transcript
+                    logger.info(f"Extracted transcript: {sentence[:100] if sentence else 'None'}")
+
             if not sentence or not sentence.strip():
+                logger.debug("No transcript text found or empty transcript")
                 return
 
             # Determine speaker (Deepgram can provide speaker diarization)
@@ -380,6 +405,7 @@ class MediaStreamHandler:
 
             # Calculate timestamp (relative to call start)
             timestamp = result.start if hasattr(result, 'start') else 0.0
+            logger.info(f"Processing transcript: speaker={speaker}, text={sentence[:50]}..., timestamp={timestamp}")
 
             # Send to Laravel
             await self.send_to_laravel(call_session_id, speaker, sentence, timestamp)
@@ -413,10 +439,10 @@ class MediaStreamHandler:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 201:
-                        logger.debug(f"Sent transcript to Laravel: {text[:50]}...")
+                        logger.info(f"Successfully sent transcript to Laravel: {text[:50]}...")
                     else:
                         response_text = await response.text()
-                        logger.warning(f"Failed to send transcript: HTTP {response.status} - {response_text}")
+                        logger.error(f"Failed to send transcript: HTTP {response.status} - {response_text}")
         except asyncio.TimeoutError:
             logger.error(f"Timeout sending transcript to Laravel for call {call_session_id}")
         except aiohttp.ClientError as e:
