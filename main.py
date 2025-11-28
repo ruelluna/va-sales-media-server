@@ -420,19 +420,57 @@ class MediaStreamHandler:
             return
 
         try:
-            # Log the result structure for debugging
-            logger.debug(f"Deepgram result type: {type(result)}")
-            logger.debug(f"Deepgram result attributes: {dir(result)}")
+            # Log the result structure for debugging (only log first few times to avoid spam)
+            if not hasattr(self, '_transcript_log_count'):
+                self._transcript_log_count = 0
+            self._transcript_log_count += 1
+
+            if self._transcript_log_count <= 3:
+                logger.info(f"Deepgram result type: {type(result)}")
+                logger.info(f"Deepgram result attributes: {[attr for attr in dir(result) if not attr.startswith('_')]}")
+
+                # Try to log the result as JSON if possible
+                try:
+                    if hasattr(result, 'to_dict'):
+                        result_dict = result.to_dict()
+                        logger.info(f"Deepgram result dict (first 3): {str(result_dict)[:500]}")
+                    elif hasattr(result, '__dict__'):
+                        logger.info(f"Deepgram result __dict__ (first 3): {str(result.__dict__)[:500]}")
+                except Exception as e:
+                    logger.debug(f"Could not serialize result: {e}")
 
             # Extract transcript text
             sentence = None
+
+            # Try multiple ways to extract the transcript
             if hasattr(result, 'channel') and hasattr(result.channel, 'alternatives'):
                 if result.channel.alternatives and len(result.channel.alternatives) > 0:
                     sentence = result.channel.alternatives[0].transcript
-                    logger.info(f"Extracted transcript: {sentence[:100] if sentence else 'None'}")
+                    logger.info(f"Extracted transcript from channel.alternatives[0].transcript: {sentence[:100] if sentence else 'None'}")
+
+            # Try alternative paths
+            if not sentence:
+                if hasattr(result, 'alternatives') and result.alternatives:
+                    sentence = result.alternatives[0].transcript if hasattr(result.alternatives[0], 'transcript') else None
+                    logger.info(f"Extracted transcript from alternatives[0]: {sentence[:100] if sentence else 'None'}")
+
+            if not sentence:
+                if hasattr(result, 'transcript'):
+                    sentence = result.transcript
+                    logger.info(f"Extracted transcript from transcript attribute: {sentence[:100] if sentence else 'None'}")
+
+            if not sentence:
+                # Try to get it from kwargs
+                if 'result' in kwargs and hasattr(kwargs['result'], 'channel'):
+                    if hasattr(kwargs['result'].channel, 'alternatives') and kwargs['result'].channel.alternatives:
+                        sentence = kwargs['result'].channel.alternatives[0].transcript
+                        logger.info(f"Extracted transcript from kwargs result: {sentence[:100] if sentence else 'None'}")
 
             if not sentence or not sentence.strip():
-                logger.debug("No transcript text found or empty transcript")
+                logger.warning("No transcript text found or empty transcript - skipping")
+                logger.warning(f"Result structure: type={type(result)}, has channel={hasattr(result, 'channel')}")
+                if hasattr(result, 'channel'):
+                    logger.warning(f"Channel structure: {dir(result.channel)}")
                 return
 
             # Determine speaker (Deepgram can provide speaker diarization)
@@ -479,6 +517,14 @@ class MediaStreamHandler:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 201:
                         logger.info(f"Successfully sent transcript to Laravel: {text[:50]}...")
+                    elif response.status == 401:
+                        response_text = await response.text()
+                        logger.error(f"Authentication failed when sending transcript: HTTP {response.status} - {response_text}")
+                        logger.error(f"Check if LARAVEL_API_TOKEN is set correctly")
+                    elif response.status == 422:
+                        response_text = await response.text()
+                        logger.error(f"Validation failed when sending transcript: HTTP {response.status} - {response_text}")
+                        logger.error(f"Payload was: call_session_id={call_session_id}, speaker={speaker}, text_length={len(text)}, timestamp={timestamp}")
                     else:
                         response_text = await response.text()
                         logger.error(f"Failed to send transcript: HTTP {response.status} - {response_text}")
