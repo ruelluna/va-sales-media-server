@@ -189,6 +189,7 @@ class MediaStreamHandler:
                     logger.info(f"Scheduling async task for transcript processing, call_session_id: {current_id}")
                     # Deepgram SDK calls handlers from its own thread, so we need to use run_coroutine_threadsafe
                     # to schedule the async function on the event loop from a different thread
+                    # Pass both args and kwargs to preserve the result object
                     coro = self.on_deepgram_transcript(*args, call_session_id=current_id, **kwargs)
                     try:
                         # Schedule the coroutine on the event loop from this thread
@@ -410,12 +411,11 @@ class MediaStreamHandler:
         """Handle Deepgram transcript events"""
         logger.info(f"Deepgram transcript event received for call_session_id: {call_session_id}")
 
-        if not args or len(args) == 0:
-            logger.warning("Deepgram transcript event has no arguments")
-            return
+        # The transcript result is passed in kwargs['result'], not args[0]
+        # args[0] is the LiveClient object
+        transcript_result = kwargs.get('result') if 'result' in kwargs else (args[0] if args else None)
 
-        result = args[0]
-        if not result:
+        if not transcript_result:
             logger.warning("Deepgram transcript result is None")
             return
 
@@ -426,62 +426,72 @@ class MediaStreamHandler:
             self._transcript_log_count += 1
 
             if self._transcript_log_count <= 3:
-                logger.info(f"Deepgram result type: {type(result)}")
-                logger.info(f"Deepgram result attributes: {[attr for attr in dir(result) if not attr.startswith('_')]}")
+                logger.info(f"Deepgram transcript_result type: {type(transcript_result)}")
+                logger.info(f"Deepgram transcript_result attributes: {[attr for attr in dir(transcript_result) if not attr.startswith('_')]}")
 
-                # Try to log the result as JSON if possible
-                try:
-                    if hasattr(result, 'to_dict'):
-                        result_dict = result.to_dict()
-                        logger.info(f"Deepgram result dict (first 3): {str(result_dict)[:500]}")
-                    elif hasattr(result, '__dict__'):
-                        logger.info(f"Deepgram result __dict__ (first 3): {str(result.__dict__)[:500]}")
-                except Exception as e:
-                    logger.debug(f"Could not serialize result: {e}")
-
-            # Extract transcript text
+            # Extract transcript text from the result object
             sentence = None
 
-            # Try multiple ways to extract the transcript
-            if hasattr(result, 'channel') and hasattr(result.channel, 'alternatives'):
-                if result.channel.alternatives and len(result.channel.alternatives) > 0:
-                    sentence = result.channel.alternatives[0].transcript
+            # Try to extract from channel.alternatives (standard Deepgram structure)
+            if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                    sentence = transcript_result.channel.alternatives[0].transcript
                     logger.info(f"Extracted transcript from channel.alternatives[0].transcript: {sentence[:100] if sentence else 'None'}")
 
             # Try alternative paths
             if not sentence:
-                if hasattr(result, 'alternatives') and result.alternatives:
-                    sentence = result.alternatives[0].transcript if hasattr(result.alternatives[0], 'transcript') else None
+                if hasattr(transcript_result, 'alternatives') and transcript_result.alternatives:
+                    sentence = transcript_result.alternatives[0].transcript if hasattr(transcript_result.alternatives[0], 'transcript') else None
                     logger.info(f"Extracted transcript from alternatives[0]: {sentence[:100] if sentence else 'None'}")
 
             if not sentence:
-                if hasattr(result, 'transcript'):
-                    sentence = result.transcript
+                if hasattr(transcript_result, 'transcript'):
+                    sentence = transcript_result.transcript
                     logger.info(f"Extracted transcript from transcript attribute: {sentence[:100] if sentence else 'None'}")
-
-            if not sentence:
-                # Try to get it from kwargs
-                if 'result' in kwargs and hasattr(kwargs['result'], 'channel'):
-                    if hasattr(kwargs['result'].channel, 'alternatives') and kwargs['result'].channel.alternatives:
-                        sentence = kwargs['result'].channel.alternatives[0].transcript
-                        logger.info(f"Extracted transcript from kwargs result: {sentence[:100] if sentence else 'None'}")
 
             if not sentence or not sentence.strip():
                 logger.warning("No transcript text found or empty transcript - skipping")
-                logger.warning(f"Result structure: type={type(result)}, has channel={hasattr(result, 'channel')}")
-                if hasattr(result, 'channel'):
-                    logger.warning(f"Channel structure: {dir(result.channel)}")
+                logger.warning(f"Result structure: type={type(transcript_result)}, has channel={hasattr(transcript_result, 'channel')}")
+                if hasattr(transcript_result, 'channel'):
+                    logger.warning(f"Channel structure: {dir(transcript_result.channel)}")
                 return
 
             # Determine speaker (Deepgram can provide speaker diarization)
             # For now, we'll use a simple heuristic or default to 'prospect'
             speaker = 'prospect'  # Default, can be enhanced with Deepgram speaker diarization
-            if hasattr(result, 'channel') and hasattr(result.channel, 'alternatives'):
-                # Check if Deepgram provides speaker information
-                pass
 
             # Calculate timestamp (relative to call start)
-            timestamp = result.start if hasattr(result, 'start') else 0.0
+            # Check multiple possible locations for timestamp
+            timestamp = 0.0
+            try:
+                # Try to get start time from the result object
+                if hasattr(transcript_result, 'start'):
+                    start_attr = getattr(transcript_result, 'start', None)
+                    # Check if it's a numeric value, not a method
+                    if start_attr is not None and not callable(start_attr):
+                        timestamp = float(start_attr)
+                elif hasattr(transcript_result, 'start_time'):
+                    timestamp = float(getattr(transcript_result, 'start_time', 0.0))
+                elif hasattr(transcript_result, 'message_ts'):
+                    timestamp = float(getattr(transcript_result, 'message_ts', 0.0))
+                elif hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                    if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                        alt = transcript_result.channel.alternatives[0]
+                        if hasattr(alt, 'start'):
+                            alt_start = getattr(alt, 'start', None)
+                            if alt_start is not None and not callable(alt_start):
+                                timestamp = float(alt_start)
+                        elif hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
+                            # Use the start time of the first word
+                            first_word = alt.words[0]
+                            if hasattr(first_word, 'start'):
+                                word_start = getattr(first_word, 'start', None)
+                                if word_start is not None:
+                                    timestamp = float(word_start)
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Could not extract timestamp: {e}, using 0.0")
+                timestamp = 0.0
+
             logger.info(f"Processing transcript: speaker={speaker}, text={sentence[:50]}..., timestamp={timestamp}")
 
             # Send to Laravel
@@ -496,12 +506,17 @@ class MediaStreamHandler:
             return
 
         url = f"{LARAVEL_API_URL}/api/media-stream"
+        # Ensure timestamp is a numeric value, not a method or object
+        timestamp_value = float(timestamp) if timestamp is not None else 0.0
+
         payload = {
-            'call_session_id': call_session_id,
-            'speaker': speaker,
-            'text': text,
-            'timestamp': timestamp,
+            'call_session_id': str(call_session_id),  # Ensure it's a string
+            'speaker': str(speaker),
+            'text': str(text),
+            'timestamp': timestamp_value,
         }
+
+        logger.debug(f"Sending transcript payload: call_session_id={payload['call_session_id']}, speaker={payload['speaker']}, text_length={len(payload['text'])}, timestamp={payload['timestamp']}")
 
         headers = {
             'Content-Type': 'application/json',
