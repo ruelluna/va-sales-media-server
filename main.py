@@ -221,40 +221,67 @@ class MediaStreamHandler:
                         interim_results=True,
                         utterance_end_ms=1000,
                         vad_events=True,
+                        diarize=True,  # Enable speaker diarization
                         sample_rate=8000,
                         encoding="linear16",
                     )
-                    logger.info("Created LiveOptions with sample_rate=8000, encoding=linear16")
+                    logger.info("Created LiveOptions with speaker diarization enabled")
                 except TypeError:
                     # If those parameters aren't supported, use basic options
                     logger.warning("sample_rate/encoding not supported in LiveOptions, using basic options")
-                    options = LiveOptions(
-                        model="nova-2",
-                        language="en-US",
-                        smart_format=True,
-                        interim_results=True,
-                        utterance_end_ms=1000,
-                        vad_events=True,
-                    )
-                    logger.info("Created LiveOptions with basic options (auto-detect format)")
+                    try:
+                        options = LiveOptions(
+                            model="nova-2",
+                            language="en-US",
+                            smart_format=True,
+                            interim_results=True,
+                            utterance_end_ms=1000,
+                            vad_events=True,
+                            diarize=True,  # Enable speaker diarization
+                        )
+                        logger.info("Created LiveOptions with speaker diarization (basic options)")
+                    except TypeError:
+                        # Fallback if diarize is not supported
+                        logger.warning("diarize not supported in LiveOptions, using basic options without diarization")
+                        options = LiveOptions(
+                            model="nova-2",
+                            language="en-US",
+                            smart_format=True,
+                            interim_results=True,
+                            utterance_end_ms=1000,
+                            vad_events=True,
+                        )
+                        logger.info("Created LiveOptions with basic options (no diarization)")
 
                 if not deepgram_connection.start(options):
                     logger.error("Failed to start Deepgram connection")
                     await websocket.close(code=1011, reason="Failed to start transcription")
                     return
-                logger.info("Deepgram connection started successfully")
+
+                # Log diarization status
+                diarize_enabled = getattr(options, 'diarize', False) if hasattr(options, 'diarize') else False
+                logger.info(f"Deepgram connection started successfully - Speaker diarization: {'ENABLED' if diarize_enabled else 'DISABLED'}")
+                if not diarize_enabled:
+                    logger.warning("WARNING: Speaker diarization is DISABLED. Only one speaker will be detected!")
             except Exception as e:
                 logger.error(f"Error starting Deepgram: {e}", exc_info=True)
                 await websocket.close(code=1011, reason="Failed to start transcription")
                 return
 
             # Store connection info
+            # Track speaker mapping: Deepgram speaker IDs -> 'va' or 'prospect'
+            # We'll use a simple heuristic: first speaker is usually the VA (caller)
+            speaker_mapping = {}  # Maps Deepgram speaker ID to 'va' or 'prospect'
+            next_speaker_index = 0  # Track which speaker index to assign next
+
             connection_info = {
                 'websocket': websocket,
                 'deepgram': deepgram_connection,
                 'twilio_call_sid': twilio_call_sid,
                 'call_session_id_ref': call_session_id_ref,
-                'media_count': 0  # Track number of media packets received
+                'media_count': 0,  # Track number of media packets received
+                'speaker_mapping': speaker_mapping,
+                'next_speaker_index': next_speaker_index,
             }
 
             if call_session_id_ref[0]:
@@ -456,9 +483,101 @@ class MediaStreamHandler:
                     logger.warning(f"Channel structure: {dir(transcript_result.channel)}")
                 return
 
-            # Determine speaker (Deepgram can provide speaker diarization)
-            # For now, we'll use a simple heuristic or default to 'prospect'
-            speaker = 'prospect'  # Default, can be enhanced with Deepgram speaker diarization
+            # Determine speaker using Deepgram speaker diarization
+            # Get connection info to access speaker mapping
+            connection_info = None
+            if call_session_id and call_session_id in self.active_streams:
+                connection_info = self.active_streams[call_session_id]
+
+            speaker = 'prospect'  # Default fallback
+
+            # Extract speaker ID from Deepgram result
+            speaker_id = None
+            try:
+                # Deepgram provides speaker info in words array or alternatives
+                if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                    if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                        alt = transcript_result.channel.alternatives[0]
+                        # Check if words have speaker information
+                        if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
+                            # Get speaker from first word (all words in an utterance should have same speaker)
+                            first_word = alt.words[0]
+                            if hasattr(first_word, 'speaker'):
+                                speaker_id = getattr(first_word, 'speaker', None)
+                            elif hasattr(first_word, 'speaker_label'):
+                                speaker_id = getattr(first_word, 'speaker_label', None)
+                            # Try alternative attribute names
+                            elif hasattr(first_word, 'speaker_id'):
+                                speaker_id = getattr(first_word, 'speaker_id', None)
+                            elif hasattr(first_word, 'speakerId'):
+                                speaker_id = getattr(first_word, 'speakerId', None)
+
+                # Alternative: check if speaker is at channel level
+                if not speaker_id and hasattr(transcript_result, 'channel'):
+                    if hasattr(transcript_result.channel, 'speaker'):
+                        speaker_id = getattr(transcript_result.channel, 'speaker', None)
+                    elif hasattr(transcript_result.channel, 'speaker_label'):
+                        speaker_id = getattr(transcript_result.channel, 'speaker_label', None)
+                    elif hasattr(transcript_result.channel, 'speaker_id'):
+                        speaker_id = getattr(transcript_result.channel, 'speaker_id', None)
+
+                # Alternative: check at result level
+                if not speaker_id:
+                    if hasattr(transcript_result, 'speaker'):
+                        speaker_id = getattr(transcript_result, 'speaker', None)
+                    elif hasattr(transcript_result, 'speaker_label'):
+                        speaker_id = getattr(transcript_result, 'speaker_label', None)
+
+                # Log speaker detection for debugging
+                if speaker_id is not None:
+                    logger.info(f"Detected speaker ID from Deepgram: {speaker_id} (type: {type(speaker_id)})")
+                else:
+                    logger.warning("No speaker ID detected in Deepgram result - diarization may not be working")
+                    # Log the structure for debugging
+                    if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                        if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                            alt = transcript_result.channel.alternatives[0]
+                            logger.warning(f"Alternative structure: {dir(alt)}")
+                            if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
+                                logger.warning(f"First word structure: {dir(alt.words[0])}")
+
+                # Map Deepgram speaker ID to 'va' or 'prospect'
+                if speaker_id is not None and connection_info:
+                    speaker_mapping = connection_info.get('speaker_mapping', {})
+                    next_speaker_index = connection_info.get('next_speaker_index', 0)
+
+                    # Convert speaker_id to string for consistent mapping
+                    speaker_key = str(speaker_id)
+
+                    # If we haven't seen this speaker before, assign it
+                    if speaker_key not in speaker_mapping:
+                        # First speaker (index 0) is typically the VA (caller)
+                        # Second speaker (index 1) is typically the prospect
+                        if next_speaker_index == 0:
+                            speaker_mapping[speaker_key] = 'va'
+                            logger.info(f"Mapping new speaker {speaker_key} to 'va' (first speaker detected)")
+                        else:
+                            speaker_mapping[speaker_key] = 'prospect'
+                            logger.info(f"Mapping new speaker {speaker_key} to 'prospect' (second speaker detected)")
+
+                        connection_info['speaker_mapping'] = speaker_mapping
+                        connection_info['next_speaker_index'] = next_speaker_index + 1
+                        self.active_streams[call_session_id] = connection_info
+
+                        # Log current mapping state
+                        logger.info(f"Current speaker mappings for call {call_session_id}: {speaker_mapping}")
+
+                    # Get the mapped speaker
+                    speaker = speaker_mapping.get(speaker_key, 'prospect')
+                    logger.info(f"Speaker {speaker_key} mapped to '{speaker}' for transcript: {sentence[:50]}...")
+                elif speaker_id is None:
+                    logger.warning("No speaker ID found in Deepgram result, using default 'prospect'")
+                    logger.warning("This may indicate that speaker diarization is not enabled or not working correctly")
+            except Exception as e:
+                logger.error(f"Error extracting speaker information: {e}", exc_info=True)
+                # Fallback to default
+                speaker = 'prospect'
+                logger.warning(f"Using fallback speaker 'prospect' due to error")
 
             # Calculate timestamp (relative to call start)
             # Check multiple possible locations for timestamp
@@ -516,7 +635,7 @@ class MediaStreamHandler:
             'timestamp': timestamp_value,
         }
 
-        logger.debug(f"Sending transcript payload: call_session_id={payload['call_session_id']}, speaker={payload['speaker']}, text_length={len(payload['text'])}, timestamp={payload['timestamp']}")
+        logger.info(f"Sending transcript to Laravel: call_session_id={payload['call_session_id']}, speaker={payload['speaker']}, text_length={len(payload['text'])}, timestamp={payload['timestamp']}, text_preview={text[:50]}...")
 
         headers = {
             'Content-Type': 'application/json',
@@ -531,7 +650,32 @@ class MediaStreamHandler:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 201:
-                        logger.info(f"Successfully sent transcript to Laravel: {text[:50]}...")
+                        logger.info(f"Successfully sent transcript to Laravel: speaker={speaker}, text={text[:50]}...")
+
+                        # Track speaker distribution for this call session
+                        if call_session_id and call_session_id in self.active_streams:
+                            connection_info = self.active_streams[call_session_id]
+                            if 'speaker_stats' not in connection_info:
+                                connection_info['speaker_stats'] = {'va': 0, 'prospect': 0, 'system': 0}
+                            connection_info['speaker_stats'][speaker] = connection_info['speaker_stats'].get(speaker, 0) + 1
+                            self.active_streams[call_session_id] = connection_info
+
+                            # Log stats every 10 transcripts
+                            total = sum(connection_info['speaker_stats'].values())
+                            if total % 10 == 0:
+                                stats = connection_info['speaker_stats']
+                                va_count = stats.get('va', 0)
+                                prospect_count = stats.get('prospect', 0)
+                                logger.info(f"Speaker distribution for call {call_session_id} (total={total}): VA={va_count}, Prospect={prospect_count}, System={stats.get('system', 0)}")
+
+                                # Warn if we're only seeing one speaker after many transcripts
+                                if total >= 20:
+                                    if va_count == 0:
+                                        logger.warning(f"WARNING: No VA transcripts detected after {total} transcripts. Check if speaker diarization is working correctly.")
+                                    elif prospect_count == 0:
+                                        logger.warning(f"WARNING: No prospect transcripts detected after {total} transcripts. Check if speaker diarization is working correctly.")
+                                    elif va_count > 0 and prospect_count > 0:
+                                        logger.info(f"✓ Both speakers detected: VA ({va_count}) and Prospect ({prospect_count})")
                     elif response.status == 401:
                         response_text = await response.text()
                         logger.error(f"Authentication failed when sending transcript: HTTP {response.status} - {response_text}")

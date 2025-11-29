@@ -1,2 +1,5 @@
 # This file ensures certbot directories are tracked in git
 # The actual certbot/conf and certbot/www directories will be created during SSL setup
+
+
+
