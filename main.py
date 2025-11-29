@@ -699,43 +699,43 @@ class MediaStreamHandler:
             session = await self.get_http_session()
             async with session.post(url, json=payload, headers=headers) as response:
                 if response.status == 201:
-                        logger.info(f"Successfully sent transcript to Laravel: speaker={speaker}, text={text[:50]}...")
+                    logger.info(f"Successfully sent transcript to Laravel: speaker={speaker}, text={text[:50]}...")
 
-                        # Track speaker distribution for this call session
-                        if call_session_id and call_session_id in self.active_streams:
-                            connection_info = self.active_streams[call_session_id]
-                            if 'speaker_stats' not in connection_info:
-                                connection_info['speaker_stats'] = {'va': 0, 'prospect': 0, 'system': 0}
-                            connection_info['speaker_stats'][speaker] = connection_info['speaker_stats'].get(speaker, 0) + 1
-                            self.active_streams[call_session_id] = connection_info
+                    # Track speaker distribution for this call session
+                    if call_session_id and call_session_id in self.active_streams:
+                        connection_info = self.active_streams[call_session_id]
+                        if 'speaker_stats' not in connection_info:
+                            connection_info['speaker_stats'] = {'va': 0, 'prospect': 0, 'system': 0}
+                        connection_info['speaker_stats'][speaker] = connection_info['speaker_stats'].get(speaker, 0) + 1
+                        self.active_streams[call_session_id] = connection_info
 
-                            # Log stats every 10 transcripts
-                            total = sum(connection_info['speaker_stats'].values())
-                            if total % 10 == 0:
-                                stats = connection_info['speaker_stats']
-                                va_count = stats.get('va', 0)
-                                prospect_count = stats.get('prospect', 0)
-                                logger.info(f"Speaker distribution for call {call_session_id} (total={total}): VA={va_count}, Prospect={prospect_count}, System={stats.get('system', 0)}")
+                        # Log stats every 10 transcripts
+                        total = sum(connection_info['speaker_stats'].values())
+                        if total % 10 == 0:
+                            stats = connection_info['speaker_stats']
+                            va_count = stats.get('va', 0)
+                            prospect_count = stats.get('prospect', 0)
+                            logger.info(f"Speaker distribution for call {call_session_id} (total={total}): VA={va_count}, Prospect={prospect_count}, System={stats.get('system', 0)}")
 
-                                # Warn if we're only seeing one speaker after many transcripts
-                                if total >= 20:
-                                    if va_count == 0:
-                                        logger.warning(f"WARNING: No VA transcripts detected after {total} transcripts. Check if speaker diarization is working correctly.")
-                                    elif prospect_count == 0:
-                                        logger.warning(f"WARNING: No prospect transcripts detected after {total} transcripts. Check if speaker diarization is working correctly.")
-                                    elif va_count > 0 and prospect_count > 0:
-                                        logger.info(f"✓ Both speakers detected: VA ({va_count}) and Prospect ({prospect_count})")
-                    elif response.status == 401:
-                        response_text = await response.text()
-                        logger.error(f"Authentication failed when sending transcript: HTTP {response.status} - {response_text}")
-                        logger.error(f"Check if LARAVEL_API_TOKEN is set correctly")
-                    elif response.status == 422:
-                        response_text = await response.text()
-                        logger.error(f"Validation failed when sending transcript: HTTP {response.status} - {response_text}")
-                        logger.error(f"Payload was: call_session_id={call_session_id}, speaker={speaker}, text_length={len(text)}, timestamp={timestamp}")
-                    else:
-                        response_text = await response.text()
-                        logger.error(f"Failed to send transcript: HTTP {response.status} - {response_text}")
+                            # Warn if we're only seeing one speaker after many transcripts
+                            if total >= 20:
+                                if va_count == 0:
+                                    logger.warning(f"WARNING: No VA transcripts detected after {total} transcripts. Check if speaker diarization is working correctly.")
+                                elif prospect_count == 0:
+                                    logger.warning(f"WARNING: No prospect transcripts detected after {total} transcripts. Check if speaker diarization is working correctly.")
+                                elif va_count > 0 and prospect_count > 0:
+                                    logger.info(f"✓ Both speakers detected: VA ({va_count}) and Prospect ({prospect_count})")
+                elif response.status == 401:
+                    response_text = await response.text()
+                    logger.error(f"Authentication failed when sending transcript: HTTP {response.status} - {response_text}")
+                    logger.error(f"Check if LARAVEL_API_TOKEN is set correctly")
+                elif response.status == 422:
+                    response_text = await response.text()
+                    logger.error(f"Validation failed when sending transcript: HTTP {response.status} - {response_text}")
+                    logger.error(f"Payload was: call_session_id={call_session_id}, speaker={speaker}, text_length={len(text)}, timestamp={timestamp}")
+                else:
+                    response_text = await response.text()
+                    logger.error(f"Failed to send transcript: HTTP {response.status} - {response_text}")
         except asyncio.TimeoutError:
             logger.error(f"Timeout sending transcript to Laravel for call {call_session_id}")
         except aiohttp.ClientError as e:
