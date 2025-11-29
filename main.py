@@ -282,6 +282,9 @@ class MediaStreamHandler:
                 'media_count': 0,  # Track number of media packets received
                 'speaker_mapping': speaker_mapping,
                 'next_speaker_index': next_speaker_index,
+                'track_to_speaker': {'inbound': 'va', 'outbound': 'prospect'},  # Direct mapping: track -> speaker
+                'current_track': None,  # Track which track we're currently receiving audio from
+                'track_history': [],  # List of (timestamp, track) tuples to help match transcripts to tracks
             }
 
             if call_session_id_ref[0]:
@@ -342,6 +345,19 @@ class MediaStreamHandler:
                             # Check if this is inbound or outbound audio (Twilio provides track parameter)
                             media_info = data.get('media', {})
                             track = media_info.get('track', 'unknown')  # 'inbound' or 'outbound'
+
+                            # Update current track and track history for speaker mapping
+                            connection_info['current_track'] = track
+
+                            # Store track history with timestamp (limit to last 100 entries to avoid memory issues)
+                            import time
+                            current_time = time.time()
+                            track_history = connection_info.get('track_history', [])
+                            track_history.append((current_time, track))
+                            # Keep only last 100 entries (roughly last 10 seconds at 10 packets/second)
+                            if len(track_history) > 100:
+                                track_history = track_history[-100:]
+                            connection_info['track_history'] = track_history
 
                             if payload:
                                 try:
@@ -565,133 +581,13 @@ class MediaStreamHandler:
                                 logger.warning(f"Alternative structure: {[attr for attr in dir(alt) if not attr.startswith('_')]}")
                 return
 
-            # Determine speaker using Deepgram speaker diarization
-            # Get connection info to access speaker mapping
+            # Determine speaker using Twilio track information (more reliable than Deepgram speaker IDs)
+            # Get connection info to access track mapping
             connection_info = None
             if call_session_id and call_session_id in self.active_streams:
                 connection_info = self.active_streams[call_session_id]
 
-            speaker = 'prospect'  # Default fallback
-
-            # Extract speaker ID from Deepgram result
-            speaker_id = None
-            try:
-                # Deepgram provides speaker info in words array or alternatives
-                if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
-                    if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
-                        alt = transcript_result.channel.alternatives[0]
-                        # Check if words have speaker information
-                        if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
-                            # Get speaker from first word (all words in an utterance should have same speaker)
-                            first_word = alt.words[0]
-                            # Try multiple attribute names for speaker ID
-                            speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId', 'speaker_label_id']
-                            for attr in speaker_attrs:
-                                if hasattr(first_word, attr):
-                                    speaker_id = getattr(first_word, attr, None)
-                                    if speaker_id is not None:
-                                        logger.debug(f"Found speaker ID in word.{attr}: {speaker_id}")
-                                        break
-
-                            # If still not found, check all words to see if any have speaker info
-                            if speaker_id is None:
-                                for word in alt.words:
-                                    for attr in speaker_attrs:
-                                        if hasattr(word, attr):
-                                            speaker_id = getattr(word, attr, None)
-                                            if speaker_id is not None:
-                                                logger.debug(f"Found speaker ID in word.{attr}: {speaker_id}")
-                                                break
-                                    if speaker_id is not None:
-                                        break
-
-                # Alternative: check if speaker is at alternative level
-                if not speaker_id and hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
-                    if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
-                        alt = transcript_result.channel.alternatives[0]
-                        speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId']
-                        for attr in speaker_attrs:
-                            if hasattr(alt, attr):
-                                speaker_id = getattr(alt, attr, None)
-                                if speaker_id is not None:
-                                    logger.debug(f"Found speaker ID in alternative.{attr}: {speaker_id}")
-                                    break
-
-                # Alternative: check if speaker is at channel level
-                if not speaker_id and hasattr(transcript_result, 'channel'):
-                    speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId']
-                    for attr in speaker_attrs:
-                        if hasattr(transcript_result.channel, attr):
-                            speaker_id = getattr(transcript_result.channel, attr, None)
-                            if speaker_id is not None:
-                                logger.debug(f"Found speaker ID in channel.{attr}: {speaker_id}")
-                                break
-
-                # Alternative: check at result level
-                if not speaker_id:
-                    speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId']
-                    for attr in speaker_attrs:
-                        if hasattr(transcript_result, attr):
-                            speaker_id = getattr(transcript_result, attr, None)
-                            if speaker_id is not None:
-                                logger.debug(f"Found speaker ID in result.{attr}: {speaker_id}")
-                                break
-
-                # Log speaker detection for debugging
-                if speaker_id is not None:
-                    logger.info(f"Detected speaker ID from Deepgram: {speaker_id} (type: {type(speaker_id)})")
-                else:
-                    # Only log warning for final results or periodically to avoid spam
-                    if is_final or (self._transcript_log_count % 20 == 0):
-                        logger.warning("No speaker ID detected in Deepgram result - diarization may not be working")
-                        # Log the structure for debugging
-                        if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
-                            if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
-                                alt = transcript_result.channel.alternatives[0]
-                                logger.warning(f"Alternative attributes: {[attr for attr in dir(alt) if not attr.startswith('_')]}")
-                                if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
-                                    logger.warning(f"First word attributes: {[attr for attr in dir(alt.words[0]) if not attr.startswith('_')]}")
-
-                # Map Deepgram speaker ID to 'va' or 'prospect'
-                if speaker_id is not None and connection_info:
-                    speaker_mapping = connection_info.get('speaker_mapping', {})
-                    next_speaker_index = connection_info.get('next_speaker_index', 0)
-
-                    # Convert speaker_id to string for consistent mapping
-                    speaker_key = str(speaker_id)
-
-                    # If we haven't seen this speaker before, assign it
-                    if speaker_key not in speaker_mapping:
-                        # First speaker (index 0) is typically the VA (caller)
-                        # Second speaker (index 1) is typically the prospect
-                        if next_speaker_index == 0:
-                            speaker_mapping[speaker_key] = 'va'
-                            logger.info(f"Mapping new speaker {speaker_key} to 'va' (first speaker detected)")
-                        else:
-                            speaker_mapping[speaker_key] = 'prospect'
-                            logger.info(f"Mapping new speaker {speaker_key} to 'prospect' (second speaker detected)")
-
-                        connection_info['speaker_mapping'] = speaker_mapping
-                        connection_info['next_speaker_index'] = next_speaker_index + 1
-                        self.active_streams[call_session_id] = connection_info
-
-                        # Log current mapping state
-                        logger.info(f"Current speaker mappings for call {call_session_id}: {speaker_mapping}")
-
-                    # Get the mapped speaker
-                    speaker = speaker_mapping.get(speaker_key, 'prospect')
-                    logger.info(f"Speaker {speaker_key} mapped to '{speaker}' for transcript: {sentence[:50]}...")
-                elif speaker_id is None:
-                    logger.warning("No speaker ID found in Deepgram result, using default 'prospect'")
-                    logger.warning("This may indicate that speaker diarization is not enabled or not working correctly")
-            except Exception as e:
-                logger.error(f"Error extracting speaker information: {e}", exc_info=True)
-                # Fallback to default
-                speaker = 'prospect'
-                logger.warning(f"Using fallback speaker 'prospect' due to error")
-
-            # Calculate timestamp (relative to call start)
-            # Check multiple possible locations for timestamp
+            # Calculate timestamp (relative to call start) - do this first as we might use it for track matching
             timestamp = 0.0
             try:
                 # Try to get start time from the result object
@@ -721,6 +617,37 @@ class MediaStreamHandler:
             except (ValueError, TypeError, AttributeError) as e:
                 logger.debug(f"Could not extract timestamp: {e}, using 0.0")
                 timestamp = 0.0
+
+            # Use track-based speaker mapping instead of Deepgram speaker IDs
+            # This is more reliable because we know:
+            # - inbound track = VA (agent/caller)
+            # - outbound track = Prospect (person being called)
+            speaker = 'prospect'  # Default fallback
+
+            if connection_info:
+                track_to_speaker = connection_info.get('track_to_speaker', {'inbound': 'va', 'outbound': 'prospect'})
+
+                # Use current track (most reliable since transcripts come shortly after audio packets)
+                current_track = connection_info.get('current_track')
+
+                if current_track and current_track in track_to_speaker:
+                    speaker = track_to_speaker[current_track]
+                    logger.info(f"Using current track for speaker mapping: track={current_track} -> speaker={speaker} (timestamp={timestamp:.2f})")
+                else:
+                    # Fallback: use the most recent track from history
+                    track_history = connection_info.get('track_history', [])
+                    if track_history:
+                        # Get the most recent track
+                        _, most_recent_track = track_history[-1]
+                        if most_recent_track in track_to_speaker:
+                            speaker = track_to_speaker[most_recent_track]
+                            logger.info(f"Using track history for speaker mapping: track={most_recent_track} -> speaker={speaker} (timestamp={timestamp:.2f})")
+                        else:
+                            logger.warning(f"Unknown track '{most_recent_track}' in track history, using default 'prospect'")
+                    else:
+                        logger.warning("No track history available, using default 'prospect'")
+            else:
+                logger.warning("No connection info available, using default 'prospect'")
 
             logger.info(f"Processing transcript: speaker={speaker}, text={sentence[:50]}..., timestamp={timestamp}")
 
