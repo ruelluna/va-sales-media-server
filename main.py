@@ -338,6 +338,11 @@ class MediaStreamHandler:
                             # Decode mu-law audio from Twilio
                             connection_info['media_count'] = connection_info.get('media_count', 0) + 1
                             payload = data.get('media', {}).get('payload')
+
+                            # Check if this is inbound or outbound audio (Twilio provides track parameter)
+                            media_info = data.get('media', {})
+                            track = media_info.get('track', 'unknown')  # 'inbound' or 'outbound'
+
                             if payload:
                                 try:
                                     # Convert base64 mu-law to PCM
@@ -347,9 +352,26 @@ class MediaStreamHandler:
                                     # Send to Deepgram
                                     if deepgram_connection:
                                         deepgram_connection.send(pcm_audio)
-                                        # Log every 100th packet to avoid spam
+                                        # Log every 100th packet to avoid spam, including track info
                                         if connection_info['media_count'] % 100 == 0:
-                                            logger.info(f"Sent {connection_info['media_count']} audio packets to Deepgram (latest: {len(pcm_audio)} bytes)")
+                                            logger.info(f"Sent {connection_info['media_count']} audio packets to Deepgram (track: {track}, latest: {len(pcm_audio)} bytes)")
+
+                                        # Track which track we're receiving audio from
+                                        if 'track_counts' not in connection_info:
+                                            connection_info['track_counts'] = {'inbound': 0, 'outbound': 0, 'unknown': 0}
+                                        connection_info['track_counts'][track] = connection_info['track_counts'].get(track, 0) + 1
+
+                                        # Warn if we're only receiving one track after many packets
+                                        if connection_info['media_count'] >= 200:
+                                            track_counts = connection_info.get('track_counts', {})
+                                            inbound_count = track_counts.get('inbound', 0)
+                                            outbound_count = track_counts.get('outbound', 0)
+                                            if inbound_count == 0 and outbound_count > 0:
+                                                logger.warning(f"WARNING: Only receiving 'outbound' audio track after {connection_info['media_count']} packets. Check Twilio Media Stream configuration.")
+                                            elif outbound_count == 0 and inbound_count > 0:
+                                                logger.warning(f"WARNING: Only receiving 'inbound' audio track after {connection_info['media_count']} packets. Check Twilio Media Stream configuration.")
+                                            elif inbound_count > 0 and outbound_count > 0:
+                                                logger.info(f"✓ Receiving audio from both tracks: inbound={inbound_count}, outbound={outbound_count}")
                                     else:
                                         logger.warning("Deepgram connection not available when trying to send audio")
                                 except Exception as e:
@@ -452,9 +474,24 @@ class MediaStreamHandler:
                 self._transcript_log_count = 0
             self._transcript_log_count += 1
 
-            if self._transcript_log_count <= 3:
-                logger.info(f"Deepgram transcript_result type: {type(transcript_result)}")
-                logger.info(f"Deepgram transcript_result attributes: {[attr for attr in dir(transcript_result) if not attr.startswith('_')]}")
+            # Check if this is a final result or interim result
+            is_final = False
+            try:
+                # Check multiple possible locations for is_final flag
+                if hasattr(transcript_result, 'is_final'):
+                    is_final = bool(getattr(transcript_result, 'is_final', False))
+                elif hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                    if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                        alt = transcript_result.channel.alternatives[0]
+                        if hasattr(alt, 'is_final'):
+                            is_final = bool(getattr(alt, 'is_final', False))
+            except Exception as e:
+                logger.debug(f"Could not determine is_final status: {e}")
+
+            if self._transcript_log_count <= 5:
+                logger.info(f"Deepgram transcript_result type: {type(transcript_result)}, is_final: {is_final}")
+                if self._transcript_log_count <= 3:
+                    logger.info(f"Deepgram transcript_result attributes: {[attr for attr in dir(transcript_result) if not attr.startswith('_')]}")
 
             # Extract transcript text from the result object
             sentence = None
@@ -462,25 +499,70 @@ class MediaStreamHandler:
             # Try to extract from channel.alternatives (standard Deepgram structure)
             if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
                 if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
-                    sentence = transcript_result.channel.alternatives[0].transcript
-                    logger.info(f"Extracted transcript from channel.alternatives[0].transcript: {sentence[:100] if sentence else 'None'}")
+                    alt = transcript_result.channel.alternatives[0]
+                    # Try multiple ways to get transcript
+                    if hasattr(alt, 'transcript'):
+                        sentence = getattr(alt, 'transcript', None)
+                    elif hasattr(alt, 'text'):
+                        sentence = getattr(alt, 'text', None)
+                    elif hasattr(alt, 'transcript_text'):
+                        sentence = getattr(alt, 'transcript_text', None)
+
+                    if sentence:
+                        logger.debug(f"Extracted transcript from channel.alternatives[0]: {sentence[:100] if len(sentence) > 100 else sentence}")
 
             # Try alternative paths
             if not sentence:
                 if hasattr(transcript_result, 'alternatives') and transcript_result.alternatives:
-                    sentence = transcript_result.alternatives[0].transcript if hasattr(transcript_result.alternatives[0], 'transcript') else None
-                    logger.info(f"Extracted transcript from alternatives[0]: {sentence[:100] if sentence else 'None'}")
+                    alt = transcript_result.alternatives[0]
+                    if hasattr(alt, 'transcript'):
+                        sentence = getattr(alt, 'transcript', None)
+                    elif hasattr(alt, 'text'):
+                        sentence = getattr(alt, 'text', None)
+                    if sentence:
+                        logger.debug(f"Extracted transcript from alternatives[0]: {sentence[:100] if len(sentence) > 100 else sentence}")
 
             if not sentence:
                 if hasattr(transcript_result, 'transcript'):
-                    sentence = transcript_result.transcript
-                    logger.info(f"Extracted transcript from transcript attribute: {sentence[:100] if sentence else 'None'}")
+                    sentence = getattr(transcript_result, 'transcript', None)
+                elif hasattr(transcript_result, 'text'):
+                    sentence = getattr(transcript_result, 'text', None)
+                if sentence:
+                    logger.debug(f"Extracted transcript from transcript attribute: {sentence[:100] if len(sentence) > 100 else sentence}")
 
+            # Try extracting from words if transcript is not available directly
             if not sentence or not sentence.strip():
-                logger.warning("No transcript text found or empty transcript - skipping")
-                logger.warning(f"Result structure: type={type(transcript_result)}, has channel={hasattr(transcript_result, 'channel')}")
-                if hasattr(transcript_result, 'channel'):
-                    logger.warning(f"Channel structure: {dir(transcript_result.channel)}")
+                try:
+                    if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                        if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                            alt = transcript_result.channel.alternatives[0]
+                            if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
+                                # Build transcript from words
+                                word_texts = []
+                                for word in alt.words:
+                                    if hasattr(word, 'word'):
+                                        word_texts.append(getattr(word, 'word', ''))
+                                    elif hasattr(word, 'text'):
+                                        word_texts.append(getattr(word, 'text', ''))
+                                if word_texts:
+                                    sentence = ' '.join(word_texts).strip()
+                                    logger.debug(f"Built transcript from words: {sentence[:100] if len(sentence) > 100 else sentence}")
+                except Exception as e:
+                    logger.debug(f"Error building transcript from words: {e}")
+
+            # Skip empty transcripts, but log more details for debugging
+            if not sentence or not sentence.strip():
+                # Only log warnings for final results or every 10th empty result to avoid spam
+                should_log = is_final or (self._transcript_log_count % 10 == 0)
+                if should_log:
+                    logger.warning(f"No transcript text found or empty transcript (is_final={is_final}) - skipping")
+                    logger.warning(f"Result structure: type={type(transcript_result)}, has channel={hasattr(transcript_result, 'channel')}")
+                    if hasattr(transcript_result, 'channel'):
+                        logger.warning(f"Channel structure: {[attr for attr in dir(transcript_result.channel) if not attr.startswith('_')]}")
+                        if hasattr(transcript_result.channel, 'alternatives') and transcript_result.channel.alternatives:
+                            if len(transcript_result.channel.alternatives) > 0:
+                                alt = transcript_result.channel.alternatives[0]
+                                logger.warning(f"Alternative structure: {[attr for attr in dir(alt) if not attr.startswith('_')]}")
                 return
 
             # Determine speaker using Deepgram speaker diarization
@@ -502,44 +584,73 @@ class MediaStreamHandler:
                         if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
                             # Get speaker from first word (all words in an utterance should have same speaker)
                             first_word = alt.words[0]
-                            if hasattr(first_word, 'speaker'):
-                                speaker_id = getattr(first_word, 'speaker', None)
-                            elif hasattr(first_word, 'speaker_label'):
-                                speaker_id = getattr(first_word, 'speaker_label', None)
-                            # Try alternative attribute names
-                            elif hasattr(first_word, 'speaker_id'):
-                                speaker_id = getattr(first_word, 'speaker_id', None)
-                            elif hasattr(first_word, 'speakerId'):
-                                speaker_id = getattr(first_word, 'speakerId', None)
+                            # Try multiple attribute names for speaker ID
+                            speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId', 'speaker_label_id']
+                            for attr in speaker_attrs:
+                                if hasattr(first_word, attr):
+                                    speaker_id = getattr(first_word, attr, None)
+                                    if speaker_id is not None:
+                                        logger.debug(f"Found speaker ID in word.{attr}: {speaker_id}")
+                                        break
+
+                            # If still not found, check all words to see if any have speaker info
+                            if speaker_id is None:
+                                for word in alt.words:
+                                    for attr in speaker_attrs:
+                                        if hasattr(word, attr):
+                                            speaker_id = getattr(word, attr, None)
+                                            if speaker_id is not None:
+                                                logger.debug(f"Found speaker ID in word.{attr}: {speaker_id}")
+                                                break
+                                    if speaker_id is not None:
+                                        break
+
+                # Alternative: check if speaker is at alternative level
+                if not speaker_id and hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                    if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                        alt = transcript_result.channel.alternatives[0]
+                        speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId']
+                        for attr in speaker_attrs:
+                            if hasattr(alt, attr):
+                                speaker_id = getattr(alt, attr, None)
+                                if speaker_id is not None:
+                                    logger.debug(f"Found speaker ID in alternative.{attr}: {speaker_id}")
+                                    break
 
                 # Alternative: check if speaker is at channel level
                 if not speaker_id and hasattr(transcript_result, 'channel'):
-                    if hasattr(transcript_result.channel, 'speaker'):
-                        speaker_id = getattr(transcript_result.channel, 'speaker', None)
-                    elif hasattr(transcript_result.channel, 'speaker_label'):
-                        speaker_id = getattr(transcript_result.channel, 'speaker_label', None)
-                    elif hasattr(transcript_result.channel, 'speaker_id'):
-                        speaker_id = getattr(transcript_result.channel, 'speaker_id', None)
+                    speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId']
+                    for attr in speaker_attrs:
+                        if hasattr(transcript_result.channel, attr):
+                            speaker_id = getattr(transcript_result.channel, attr, None)
+                            if speaker_id is not None:
+                                logger.debug(f"Found speaker ID in channel.{attr}: {speaker_id}")
+                                break
 
                 # Alternative: check at result level
                 if not speaker_id:
-                    if hasattr(transcript_result, 'speaker'):
-                        speaker_id = getattr(transcript_result, 'speaker', None)
-                    elif hasattr(transcript_result, 'speaker_label'):
-                        speaker_id = getattr(transcript_result, 'speaker_label', None)
+                    speaker_attrs = ['speaker', 'speaker_label', 'speaker_id', 'speakerId']
+                    for attr in speaker_attrs:
+                        if hasattr(transcript_result, attr):
+                            speaker_id = getattr(transcript_result, attr, None)
+                            if speaker_id is not None:
+                                logger.debug(f"Found speaker ID in result.{attr}: {speaker_id}")
+                                break
 
                 # Log speaker detection for debugging
                 if speaker_id is not None:
                     logger.info(f"Detected speaker ID from Deepgram: {speaker_id} (type: {type(speaker_id)})")
                 else:
-                    logger.warning("No speaker ID detected in Deepgram result - diarization may not be working")
-                    # Log the structure for debugging
-                    if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
-                        if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
-                            alt = transcript_result.channel.alternatives[0]
-                            logger.warning(f"Alternative structure: {dir(alt)}")
-                            if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
-                                logger.warning(f"First word structure: {dir(alt.words[0])}")
+                    # Only log warning for final results or periodically to avoid spam
+                    if is_final or (self._transcript_log_count % 20 == 0):
+                        logger.warning("No speaker ID detected in Deepgram result - diarization may not be working")
+                        # Log the structure for debugging
+                        if hasattr(transcript_result, 'channel') and hasattr(transcript_result.channel, 'alternatives'):
+                            if transcript_result.channel.alternatives and len(transcript_result.channel.alternatives) > 0:
+                                alt = transcript_result.channel.alternatives[0]
+                                logger.warning(f"Alternative attributes: {[attr for attr in dir(alt) if not attr.startswith('_')]}")
+                                if hasattr(alt, 'words') and alt.words and len(alt.words) > 0:
+                                    logger.warning(f"First word attributes: {[attr for attr in dir(alt.words[0]) if not attr.startswith('_')]}")
 
                 # Map Deepgram speaker ID to 'va' or 'prospect'
                 if speaker_id is not None and connection_info:
