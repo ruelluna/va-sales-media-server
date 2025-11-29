@@ -51,6 +51,7 @@ class MediaStreamHandler:
         self.deepgram = DeepgramClient(DEEPGRAM_API_KEY)
         self.active_streams = {}
         self.server = None
+        self.http_session = None
 
     async def handle_twilio_stream(self, websocket, path):
         """Handle incoming Twilio Media Stream WebSocket connection"""
@@ -468,6 +469,13 @@ class MediaStreamHandler:
 
         return bytes(pcm_data)
 
+    async def get_http_session(self):
+        """Get or create a reusable HTTP session"""
+        if self.http_session is None or self.http_session.closed:
+            timeout = aiohttp.ClientTimeout(total=10)
+            self.http_session = aiohttp.ClientSession(timeout=timeout)
+        return self.http_session
+
     def on_deepgram_open(self, *args, **kwargs):
         """Handle Deepgram connection open"""
         logger.info(f"Deepgram connection opened - args: {args}, kwargs: {kwargs}")
@@ -503,6 +511,10 @@ class MediaStreamHandler:
                             is_final = bool(getattr(alt, 'is_final', False))
             except Exception as e:
                 logger.debug(f"Could not determine is_final status: {e}")
+
+            # Skip interim results - only send final transcripts to Laravel
+            if not is_final:
+                return
 
             if self._transcript_log_count <= 5:
                 logger.info(f"Deepgram transcript_result type: {type(transcript_result)}, is_final: {is_final}")
@@ -684,10 +696,9 @@ class MediaStreamHandler:
             headers['Authorization'] = f'Bearer {LARAVEL_API_TOKEN}'
 
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers=headers) as response:
-                    if response.status == 201:
+            session = await self.get_http_session()
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status == 201:
                         logger.info(f"Successfully sent transcript to Laravel: speaker={speaker}, text={text[:50]}...")
 
                         # Track speaker distribution for this call session
@@ -798,6 +809,11 @@ async def main():
                     stream_info['deepgram'].finish()
                 except Exception:
                     pass
+
+        # Close HTTP session if it exists
+        if handler.http_session is not None and not handler.http_session.closed:
+            await handler.http_session.close()
+            logger.info("HTTP session closed")
 
 
 if __name__ == "__main__":
